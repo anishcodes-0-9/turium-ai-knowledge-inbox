@@ -12,7 +12,7 @@ export function createLogger(level: string, nodeEnv: string): Logger {
     base: { service: 'inbox-server' },
     redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], remove: true },
     ...(pretty
-      ? { transport: { target: 'pino-pretty', options: { colorize: true, translateTime: 'HH:MM:ss', ignore: 'pid,hostname,service' } } }
+      ? { transport: { target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname,service' } } }
       : {}),
   });
 }

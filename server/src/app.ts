@@ -71,6 +71,13 @@ export function createApp({ config, log, ai, fetchOverrides, workerOverrides, st
       // Keep request logs compact and free of bodies (notes are private user data).
       serializers: { req: (req) => ({ id: req.id, method: req.method, url: req.url }), res: (res) => ({ statusCode: res.statusCode }) },
       autoLogging: { ignore: (req) => req.url === '/health' },
+      // The error handler already logs every failure with its code and cause; keep the
+      // request-completed line to status/timing instead of a synthetic stack trace.
+      customErrorObject: (_req, _res, _error, val) => {
+        const { err: _ignored, ...rest } = val as Record<string, unknown>;
+        return rest;
+      },
+      customErrorMessage: (_req, res) => `request completed with ${res.statusCode}`,
     }),
   );
   app.use((req, res, next) => {
