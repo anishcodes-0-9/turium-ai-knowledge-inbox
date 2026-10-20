@@ -200,6 +200,7 @@ describe('POST /query', () => {
     expect(res.body.answer).toContain('[1]');
     expect(res.body.citations).toHaveLength(1);
     const c = res.body.citations[0];
+    expect(c.passage).toBe(1);
     expect(c.title).toBe('Our team mascot is a purple llama named Steve.');
     expect(c.snippet).toContain('Steve');
     expect(c.sourceType).toBe('note');

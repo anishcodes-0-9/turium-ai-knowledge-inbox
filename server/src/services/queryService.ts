@@ -6,6 +6,8 @@ import { rankChunks, selectContext, type SelectionOptions } from './retrieval.js
 import { generateAnswer } from './answerGenerator.js';
 
 export interface Citation {
+  /** 1-based passage number as it appears in the answer text (e.g. "[2]"). */
+  passage: number;
   /** Stable chunk id (`<itemId>:<chunkIndex>`). */
   chunkId: string;
   itemId: string;
@@ -73,7 +75,7 @@ export async function answerQuestion(deps: QueryDeps, input: { question: string;
 
   // Citations can only ever point at chunks that were in the prompt (and therefore exist in the DB).
   const citations: Citation[] = generated.sufficient
-    ? generated.citedNumbers.map((n) => toCitation(selected[n - 1]!))
+    ? generated.citedNumbers.map((n) => toCitation(n, selected[n - 1]!))
     : [];
 
   return {
@@ -85,8 +87,9 @@ export async function answerQuestion(deps: QueryDeps, input: { question: string;
   };
 }
 
-function toCitation(s: { chunk: { id: string; itemId: string; chunkIndex: number; itemTitle: string; itemSourceType: SourceType; itemUrl: string | null; text: string }; score: number }): Citation {
+function toCitation(passage: number, s: { chunk: { id: string; itemId: string; chunkIndex: number; itemTitle: string; itemSourceType: SourceType; itemUrl: string | null; text: string }; score: number }): Citation {
   return {
+    passage,
     chunkId: s.chunk.id,
     itemId: s.chunk.itemId,
     chunkIndex: s.chunk.chunkIndex,

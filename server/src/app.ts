@@ -1,4 +1,6 @@
 import express, { type Express } from 'express';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pinoHttp } from 'pino-http';
 import type { AppConfig } from './config.js';
@@ -33,13 +35,15 @@ export interface CreateAppOptions {
   fetchOverrides?: Partial<FetchOptions>;
   /** Test hook for the worker (e.g. zero backoff). */
   workerOverrides?: Partial<WorkerOptions>;
+  /** Directory of the built frontend; when it exists it is served from the same port (single-process local run). */
+  staticDir?: string;
 }
 
 /**
  * Composition root. Builds the Express app and wires repositories, services
  * and the worker together. Nothing here starts listening — `index.ts` does.
  */
-export function createApp({ config, log, ai, fetchOverrides, workerOverrides }: CreateAppOptions): AppContext {
+export function createApp({ config, log, ai, fetchOverrides, workerOverrides, staticDir }: CreateAppOptions): AppContext {
   const db = openDatabase(config.DATABASE_PATH, log);
   const items = new ItemsRepo(db);
   const chunks = new ChunksRepo(db);
@@ -86,6 +90,11 @@ export function createApp({ config, log, ai, fetchOverrides, workerOverrides }: 
       defaults: { topK: config.RETRIEVAL_TOP_K, minScore: config.RETRIEVAL_MIN_SCORE, contextBudgetChars: config.RETRIEVAL_CONTEXT_BUDGET_CHARS },
     }),
   );
+  if (staticDir && existsSync(join(staticDir, 'index.html'))) {
+    log.info({ staticDir }, 'serving built frontend');
+    app.use(express.static(staticDir));
+    app.get('/{*splat}', (req, res, next) => (req.accepts('html') ? res.sendFile(join(staticDir, 'index.html')) : next()));
+  }
   app.use(notFoundHandler);
   app.use(errorHandler);
 

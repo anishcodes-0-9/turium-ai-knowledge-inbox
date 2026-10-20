@@ -3,6 +3,8 @@ import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { createApp } from './app.js';
 import { OpenAiProvider } from './providers/openAiProvider.js';
+import { fileURLToPath } from 'node:url';
+import { resolve, dirname } from 'node:path';
 
 loadDotEnv();
 const config = loadConfig();
@@ -21,7 +23,8 @@ const ai = new OpenAiProvider(
   log.child({ component: 'ai' }),
 );
 
-const ctx = createApp({ config, log, ai });
+const webDist = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist');
+const ctx = createApp({ config, log, ai, staticDir: webDist });
 ctx.worker.start();
 
 const server = ctx.app.listen(config.PORT, () => {
