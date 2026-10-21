@@ -30,7 +30,7 @@ export function AddContentForm({ onSubmit }: Props) {
     setNotice(null);
     try {
       const item = await onSubmit(mode === 'note' ? { type: 'note', content: note } : { type: 'url', url });
-      setNotice(`Saved "${item.title}". Indexing in the background…`);
+      setNotice(`Saved "${item.title}". Its indexing status is shown in the list below.`);
       if (mode === 'note') setNote('');
       else setUrl('');
     } catch (err) {

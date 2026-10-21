@@ -7,6 +7,8 @@ import { AppError } from '../src/errors.js';
 /** Local server impersonating "public.test"; the test IP policy allows only 127.0.0.1. */
 let server: http.Server;
 let port: number;
+/** Paths whose server-side connection has closed; proves the client cancelled the request. */
+const closedPaths: string[] = [];
 const hosts: Record<string, string> = { 'public.test': '127.0.0.1', 'internal.test': '10.0.0.5', 'meta.test': '169.254.169.254', 'v6.test': '::1' };
 
 const opts = (over: Partial<FetchOptions> = {}): FetchOptions => ({
@@ -35,6 +37,19 @@ beforeAll(async () => {
       const push = () => { if (n++ < 40 && res.write('y'.repeat(1000))) setImmediate(push); else if (n >= 40) res.end(); else res.once('drain', push); };
       return push();
     }
+    const drip = (status: number, headers: http.OutgoingHttpHeaders) => {
+      // Headers immediately, then one byte every 50ms forever: an idle timeout never fires.
+      res.writeHead(status, headers);
+      const iv = setInterval(() => res.write('x'), 50);
+      res.on('close', () => {
+        clearInterval(iv);
+        closedPaths.push(path);
+      });
+    };
+    if (path === '/drip') return drip(200, { 'content-type': 'text/html' });
+    if (path === '/drip-redirect') return drip(302, { location: '/page', 'content-type': 'text/html' });
+    if (path === '/drip-500') return drip(500, { 'content-type': 'text/html' });
+    if (path === '/slow-hop') return void setTimeout(() => res.writeHead(302, { location: '/slow-hop' }).end(), 150);
     if (path === '/slow') return void setTimeout(() => res.writeHead(200, { 'content-type': 'text/html' }).end('late'), 1500);
     if (path === '/redirect-ok') return void res.writeHead(302, { location: '/page' }).end();
     if (path === '/redirect-internal') return void res.writeHead(302, { location: `http://internal.test:${port}/page` }).end();
@@ -114,6 +129,36 @@ describe('fetchUrl', () => {
     const err = await expectCode(fetchUrl(u('/slow'), opts({ timeoutMs: 300 })), 'url_fetch_failed');
     expect(err.message).toMatch(/timed out/i);
   });
+  it('enforces a total deadline against a slow-drip body and cancels the request', async () => {
+    const started = Date.now();
+    const err = await expectCode(fetchUrl(u('/drip'), opts({ timeoutMs: 400, maxBytes: 1_000_000 })), 'url_fetch_failed');
+    const elapsed = Date.now() - started;
+    expect(err.message).toMatch(/timed out/i);
+    expect(elapsed).toBeGreaterThanOrEqual(350);
+    expect(elapsed).toBeLessThan(1500);
+    await waitFor(() => closedPaths.includes('/drip'));
+  });
+
+  it('counts time spent across redirect hops against the same deadline', async () => {
+    // Each hop takes ~150ms and redirects to itself; the deadline must fire before the redirect limit.
+    const err = await expectCode(fetchUrl(u('/slow-hop'), opts({ timeoutMs: 400, maxRedirects: 10 })), 'url_fetch_failed');
+    expect(err.message).toMatch(/timed out/i);
+  });
+
+  it('times out a DNS lookup that never answers', async () => {
+    const started = Date.now();
+    const err = await expectCode(fetchUrl(u('/page'), opts({ timeoutMs: 300, resolve: () => new Promise<string[]>(() => {}) })), 'url_fetch_failed');
+    expect(err.message).toMatch(/resolving/i);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('closes redirect and error responses instead of draining a slow body in the background', async () => {
+    const doc = await fetchUrl(u('/drip-redirect'), opts({ timeoutMs: 2000 }));
+    expect(doc.body).toContain('hello world');
+    await expectCode(fetchUrl(u('/drip-500'), opts({ timeoutMs: 2000 })), 'url_fetch_failed');
+    await waitFor(() => closedPaths.includes('/drip-redirect') && closedPaths.includes('/drip-500'));
+  });
+
   it('blocks hosts that resolve to private addresses before connecting', async () => {
     await expectCode(fetchUrl(u('/page', 'internal.test'), opts()), 'url_blocked', 422);
     await expectCode(fetchUrl(u('/page', 'meta.test'), opts()), 'url_blocked', 422);
@@ -151,3 +196,11 @@ describe('fetchUrl', () => {
     expect(err.message).toMatch(/refused/i);
   });
 });
+
+async function waitFor(cond: () => boolean, timeoutMs = 1000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > until) throw new Error('condition not met in time');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}

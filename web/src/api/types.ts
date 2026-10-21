@@ -44,7 +44,7 @@ export interface Citation {
   score: number;
 }
 
-export type InsufficientReason = 'no_indexed_content' | 'no_relevant_chunks' | 'model_reported_insufficient';
+export type InsufficientReason = 'no_indexed_content' | 'no_relevant_chunks' | 'model_reported_insufficient' | 'unverifiable_answer';
 
 export interface QueryResult {
   answer: string;

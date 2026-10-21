@@ -39,7 +39,11 @@ export function itemsRouter(deps: ItemsRouteDeps): Router {
     const item = deps.items.getById(id);
     if (!item) throw new AppError('not_found', 'Item not found');
     if (item.status !== 'failed') throw new AppError('conflict', `Only failed items can be retried (current status: ${item.status})`);
-    deps.items.requeue(id, { resetAttempts: true });
+    // The check above and this write are separate statements; make the write itself conditional
+    // so a concurrent change between them is reported instead of overwritten.
+    if (!deps.items.requeue(id, { resetAttempts: true, onlyIfStatus: 'failed' })) {
+      throw new AppError('conflict', 'Item changed while retrying; refresh and try again');
+    }
     req.log.info({ itemId: id }, 'item manually requeued');
     deps.onItemQueued();
     res.status(202).json({ item: toItemSummary(deps.items.getById(id)!, 0) });

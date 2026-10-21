@@ -13,6 +13,13 @@ export interface AiProvider {
   readonly chatModel: string;
   /** Embeds texts in order; returns one vector per input. */
   embed(texts: string[]): Promise<Float32Array[]>;
-  /** Runs a chat completion that must return a JSON object; returns the raw text. */
-  completeJson(messages: ChatMessage[]): Promise<string>;
+  /** Runs a chat completion that must return a JSON object. */
+  completeJson(messages: ChatMessage[]): Promise<ChatCompletion>;
+}
+
+export interface ChatCompletion {
+  /** Raw text returned by the model. */
+  content: string;
+  /** True when generation stopped because it hit the output token limit (finish_reason "length"). */
+  truncated: boolean;
 }

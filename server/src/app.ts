@@ -86,7 +86,7 @@ export function createApp({ config, log, ai, fetchOverrides, workerOverrides, st
   });
   app.use(express.json({ limit: '1mb' }));
 
-  app.use(healthRouter({ items, embeddingModel: ai.embeddingModel, chatModel: ai.chatModel, startedAt: new Date() }));
+  app.use(healthRouter({ items, embeddingModel: ai.embeddingModel, chatModel: ai.chatModel, startedAt: new Date(), workerStatus: () => worker.status() }));
   app.use(ingestRouter({ items, noteMaxChars: config.NOTE_MAX_CHARS, onItemQueued }));
   app.use(itemsRouter({ items, chunks, onItemQueued }));
   app.use(

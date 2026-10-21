@@ -60,7 +60,8 @@ export async function processItem(deps: IngestionDeps, item: ItemRecord): Promis
       throw new AppError('extraction_failed', 'No readable text could be extracted from the page', { retryable: false });
     }
     content = page.text;
-    deps.items.setContent(item.id, { title: page.title, content });
+    // Lost race: another writer finished this item while we fetched. Stop before paying for embeddings.
+    if (!deps.items.setContent(item.id, { title: page.title, content })) throw new ItemStateConflictError(item.id);
   }
 
   const pieces = chunkText(content, deps.chunking);
@@ -81,11 +82,24 @@ export async function processItem(deps: IngestionDeps, item: ItemRecord): Promis
   }));
 
   // Chunks and the status flip are atomic: an item is never `indexed` without its chunks.
+  // If the item is no longer `processing` (another writer already finished it), the whole
+  // transaction is rolled back, so a stale success cannot rewrite the winner's chunks.
   transaction(deps.db, () => {
     deps.chunks.replaceForItem(item.id, newChunks);
-    deps.items.markIndexed(item.id);
+    if (!deps.items.markIndexed(item.id)) throw new ItemStateConflictError(item.id);
   });
   return { chunkCount: newChunks.length };
+}
+
+/**
+ * Raised when an outcome could not be recorded because the item had already left
+ * `processing`. It is not a processing failure: the worker logs it and writes nothing.
+ */
+export class ItemStateConflictError extends Error {
+  constructor(readonly itemId: string) {
+    super(`Item ${itemId} is no longer processing; its outcome was not recorded`);
+    this.name = 'ItemStateConflictError';
+  }
 }
 
 /** Deterministic chunk id: re-processing an item yields the same ids. */

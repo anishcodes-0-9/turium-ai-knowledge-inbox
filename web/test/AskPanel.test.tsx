@@ -69,6 +69,25 @@ describe('AskPanel', () => {
     expect(screen.queryByText('Sources')).toBeNull();
   });
 
+  it('shows the model-reported insufficient state with the fixed reason and no model text', () => {
+    const result = makeResult({ answer: 'Your saved knowledge does not contain enough information to answer this question.', sufficientEvidence: false, insufficientReason: 'model_reported_insufficient', citations: [] });
+    render(<AskPanel ask={ask({ result, question: 'llama lifespan?' })} indexedCount={1} activeCount={0} onOpenItem={vi.fn()} />);
+    const box = screen.getByTestId('insufficient-evidence');
+    expect(box).toHaveTextContent('Related content was found, but it does not actually answer the question.');
+    expect(box).not.toHaveTextContent('Model note');
+    expect(screen.queryByText('Sources')).toBeNull();
+  });
+
+  it('shows the unverifiable-answer state without sources or the model text', () => {
+    const result = makeResult({ answer: 'The model did not return an answer that could be tied to your saved sources, so no answer is shown.', sufficientEvidence: false, insufficientReason: 'unverifiable_answer', citations: [] });
+    render(<AskPanel ask={ask({ result, question: 'mascot?' })} indexedCount={1} activeCount={0} onOpenItem={vi.fn()} />);
+    const box = screen.getByTestId('insufficient-evidence');
+    expect(box).toHaveTextContent('Not enough evidence in your saved knowledge.');
+    expect(box).toHaveTextContent('could be tied to your saved sources');
+    expect(box).not.toHaveTextContent('Model note');
+    expect(screen.queryByText('Sources')).toBeNull();
+  });
+
   it('shows errors and lets the user clear a result', async () => {
     const reset = vi.fn();
     const { rerender } = render(<AskPanel ask={ask({ error: 'AI provider rate limit reached; please try again shortly' })} indexedCount={1} activeCount={0} onOpenItem={vi.fn()} />);

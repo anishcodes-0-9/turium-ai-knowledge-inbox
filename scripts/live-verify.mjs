@@ -4,7 +4,8 @@
  *
  * Starts the server on a scratch database, then:
  *   1. ingests a note with a distinctive fact and waits for `indexed`
- *   2. asks a question the note answers → expects an answer + a citation to that note
+ *   2. asks two single-fact questions the note answers → each answer must state the fact
+ *      and cite that note
  *   3. asks an unrelated question → expects sufficientEvidence=false
  *   4. ingests a URL pointing at a private address → expects a visible `failed` state
  *   5. ingests a public URL (skipped with --no-network) and waits for its final state
@@ -95,15 +96,21 @@ try {
   const indexed = await waitForFinalStatus(noteId);
   record('note reaches indexed with chunks', indexed.status === 'indexed' && indexed.chunkCount >= 1, `${indexed.chunkCount} chunk(s) in ${Date.now() - t0}ms${indexed.error ? ` error=${indexed.error.code}` : ''}`);
 
-  // 2. Supported question
-  const q1 = await http('/query', { method: 'POST', body: JSON.stringify({ question: 'What is the office plant called and who waters it?' }) });
-  const a1 = q1.body ?? {};
-  const citesNote = (a1.citations ?? []).some((c) => c.itemId === noteId);
-  const mentions = /gerald/i.test(a1.answer ?? '') && /priya/i.test(a1.answer ?? '');
-  record('POST /query answers the supported question', q1.status === 200 && a1.sufficientEvidence === true, `answer="${(a1.answer ?? '').slice(0, 160)}"`);
-  record('answer mentions the facts from the note', mentions);
-  record('citation points at the saved note', citesNote, `citations=${JSON.stringify((a1.citations ?? []).map((c) => ({ passage: c.passage, title: c.title, score: c.score })))}`);
-  console.log(`      retrieval: ${JSON.stringify(a1.retrieval)}`);
+  // 2. Supported questions. Each asks for exactly one fact, so a correct answer must contain
+  //    that proper noun whatever the wording ("What is it called?" was ambiguous: a model can
+  //    correctly answer with the species instead of the name). Both facts are still required.
+  const facts = [
+    { question: 'What is the name of the office plant?', expect: /\bgerald\b/i, label: 'name (Gerald)' },
+    { question: 'Who waters the office plant?', expect: /\bpriya\b/i, label: 'waterer (Priya)' },
+  ];
+  for (const f of facts) {
+    const r = await http('/query', { method: 'POST', body: JSON.stringify({ question: f.question }) });
+    const a = r.body ?? {};
+    record(`answers "${f.question}" with sufficient evidence`, r.status === 200 && a.sufficientEvidence === true, `answer="${(a.answer ?? '').slice(0, 160)}"`);
+    record(`answer states the ${f.label}`, f.expect.test(a.answer ?? ''));
+    record('citation points at the saved note', (a.citations ?? []).some((c) => c.itemId === noteId), `citations=${JSON.stringify((a.citations ?? []).map((c) => ({ passage: c.passage, title: c.title, score: c.score })))}`);
+    console.log(`      retrieval: ${JSON.stringify(a.retrieval)}`);
+  }
 
   // 3. Unrelated question
   const q2 = await http('/query', { method: 'POST', body: JSON.stringify({ question: 'What is the boiling point of tungsten in kelvin?' }) });
@@ -136,8 +143,12 @@ try {
   await startServer();
   const after = await http(`/items/${noteId}`);
   record('item persists across restart', after.status === 200 && after.body?.item?.status === 'indexed');
-  const q3 = await http('/query', { method: 'POST', body: JSON.stringify({ question: 'Who waters the plant named Gerald?' }) });
-  record('query works after restart with citation', q3.status === 200 && q3.body?.sufficientEvidence === true && (q3.body?.citations ?? []).some((c) => c.itemId === noteId), `answer="${(q3.body?.answer ?? '').slice(0, 120)}"`);
+  const q3 = await http('/query', { method: 'POST', body: JSON.stringify({ question: 'Who waters the office plant?' }) });
+  record(
+    'query after restart states the fact and cites the note',
+    q3.status === 200 && q3.body?.sufficientEvidence === true && /\bpriya\b/i.test(q3.body?.answer ?? '') && (q3.body?.citations ?? []).some((c) => c.itemId === noteId),
+    `answer="${(q3.body?.answer ?? '').slice(0, 120)}"`,
+  );
 } catch (err) {
   record('unexpected error', false, err instanceof Error ? err.message : String(err));
 } finally {

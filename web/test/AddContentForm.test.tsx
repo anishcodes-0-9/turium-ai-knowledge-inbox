@@ -25,6 +25,8 @@ describe('AddContentForm', () => {
 
     resolve(makeItem({ title: 'The wifi password is pelican42' }));
     expect(await screen.findByRole('status')).toHaveTextContent('Saved "The wifi password is pelican42"');
+    // The notice must stay true after indexing finishes, so it must not claim indexing is in progress.
+    expect(screen.getByRole('status')).not.toHaveTextContent('Indexing in the background');
     expect(screen.getByLabelText('Note')).toHaveValue('');
   });
 

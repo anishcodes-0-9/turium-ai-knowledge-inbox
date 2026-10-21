@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import { AppError } from '../errors.js';
 import type { Logger } from '../logger.js';
-import type { AiProvider, ChatMessage } from './aiProvider.js';
+import type { AiProvider, ChatCompletion, ChatMessage } from './aiProvider.js';
 
 export interface OpenAiProviderOptions {
   baseURL: string;
@@ -13,6 +13,8 @@ export interface OpenAiProviderOptions {
   /** When set, any embedding of a different length is rejected. */
   expectedDimensions?: number;
   embedBatchSize?: number;
+  /** Test hook: replaces the HTTP fetch used by the SDK. */
+  fetch?: typeof fetch;
 }
 
 /**
@@ -31,7 +33,7 @@ export class OpenAiProvider implements AiProvider {
     this.chatModel = opts.chatModel;
     this.batchSize = opts.embedBatchSize ?? 64;
     this.expectedDimensions = opts.expectedDimensions;
-    this.client = new OpenAI({ baseURL: opts.baseURL, apiKey: opts.apiKey, timeout: opts.timeoutMs, maxRetries: opts.maxRetries });
+    this.client = new OpenAI({ baseURL: opts.baseURL, apiKey: opts.apiKey, timeout: opts.timeoutMs, maxRetries: opts.maxRetries, ...(opts.fetch ? { fetch: opts.fetch } : {}) });
   }
 
   async embed(texts: string[]): Promise<Float32Array[]> {
@@ -54,7 +56,7 @@ export class OpenAiProvider implements AiProvider {
     return out;
   }
 
-  async completeJson(messages: ChatMessage[]): Promise<string> {
+  async completeJson(messages: ChatMessage[]): Promise<ChatCompletion> {
     const started = Date.now();
     const res = await this.call('chat', () =>
       this.client.chat.completions.create({
@@ -64,10 +66,11 @@ export class OpenAiProvider implements AiProvider {
         response_format: { type: 'json_object' },
       }),
     );
-    const text = res.choices[0]?.message?.content;
-    this.log.debug({ model: this.chatModel, ms: Date.now() - started, usage: res.usage, finish: res.choices[0]?.finish_reason }, 'chat completion generated');
+    const choice = res.choices[0];
+    const text = choice?.message?.content;
+    this.log.debug({ model: this.chatModel, ms: Date.now() - started, usage: res.usage, finish: choice?.finish_reason }, 'chat completion generated');
     if (!text) throw new AppError('provider_error', 'Chat provider returned an empty response', { retryable: true });
-    return text;
+    return { content: text, truncated: choice?.finish_reason === 'length' };
   }
 
   private validateDimensions(vec: Float32Array, reference?: Float32Array): void {

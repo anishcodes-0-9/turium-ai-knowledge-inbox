@@ -1,4 +1,4 @@
-import type { AiProvider, ChatMessage } from '../../src/providers/aiProvider.js';
+import type { AiProvider, ChatCompletion, ChatMessage } from '../../src/providers/aiProvider.js';
 
 const DIMS = 64;
 
@@ -21,7 +21,8 @@ export function fakeEmbed(text: string, dims = DIMS): Float32Array {
   return v;
 }
 
-export type ChatScript = (messages: ChatMessage[]) => string;
+/** Returns raw model text (not truncated), or a full completion to simulate truncation. */
+export type ChatScript = (messages: ChatMessage[]) => string | ChatCompletion;
 
 export class FakeAiProvider implements AiProvider {
   readonly embeddingModel = 'fake-embed-v1';
@@ -39,10 +40,11 @@ export class FakeAiProvider implements AiProvider {
     return texts.map((t) => fakeEmbed(t));
   }
 
-  async completeJson(messages: ChatMessage[]): Promise<string> {
+  async completeJson(messages: ChatMessage[]): Promise<ChatCompletion> {
     this.chatCalls.push(messages);
     if (this.chatError) throw this.chatError;
-    return this.chatScript(messages);
+    const out = this.chatScript(messages);
+    return typeof out === 'string' ? { content: out, truncated: false } : out;
   }
 }
 

@@ -10,7 +10,7 @@ Source of truth: `Turium_AI_Interview_Assignment.pdf`. Each row maps a requireme
 | 1.2 | Add URLs, fetch page content server-side | `services/urlFetcher.ts`, `htmlExtractor.ts`, `ingestionService.ts#processItem` | API: `POST /ingest (urls)`; Unit: `urlFetcher.test.ts`, `htmlExtractor.test.ts`; Live step 5 |
 | 1.3 | Store raw content + metadata (timestamp, source type) | `db/schema.ts` (`items`: `content`, `created_at`, `source_type`, …), `db/itemsRepo.ts` | API: item fields asserted in list/detail tests; Live step 6 (persistence across restart) |
 | 2.1 | Intentional chunking strategy | `services/chunker.ts` (paragraph/sentence-aware window with overlap); README "Chunking strategy" | Unit: `chunker.test.ts` (boundaries, overlap, size cap, determinism, no duplicates) |
-| 2.2 | Embeddings generation | `providers/openAiProvider.ts#embed` (batched, dimension-validated) | Unit/API via `FakeAiProvider`; Live step 1 (real `nomic-embed-text` / OpenAI) |
+| 2.2 | Embeddings generation | `providers/openAiProvider.ts#embed` (batched, dimension-validated) | Unit/API via `FakeAiProvider`; Live step 1 (real `nomic-embed-text`); manual run with OpenAI `text-embedding-3-small` (see `VERIFICATION.md`) |
 | 2.3 | Vector storage | `chunks.embedding` Float32 BLOB + `embedding_model`/`embedding_dims`, `db/chunksRepo.ts` | API: chunk counts, retry idempotency; `countIncompatible` guard |
 | 2.4 | Enter a question, retrieve top relevant chunks | `services/retrieval.ts` (`rankChunks`, `selectContext`), `queryService.ts` | Unit: `retrieval.test.ts`; API: `POST /query` suite |
 | 2.5 | Pass context + question to LLM | `services/answerGenerator.ts#buildMessages`, `openAiProvider.ts#completeJson` | Unit: `answerGenerator.test.ts` (prompt shape); API: prompt content asserted; Live step 2 |
@@ -32,7 +32,7 @@ Source of truth: `Turium_AI_Interview_Assignment.pdf`. Each row maps a requireme
 | Vector store choice | README "Vector storage rationale" | — |
 | What breaks at scale | README "What breaks at scale" | — |
 | Production changes | README "Sensible production changes" | — |
-| Structured logging | `logger.ts` (pino JSON), `app.ts` (pino-http, request ids), per-stage worker/query logs | Smoke run output in `VERIFICATION.md` |
+| Structured logging | `logger.ts` (pino JSON), `app.ts` (pino-http, request ids), per-stage worker/query logs | `worker.test.ts` asserts structured fields on real pino output; smoke run described in `VERIFICATION.md` |
 | Clear error messages | `errors.ts` codes + human messages; UI surfaces them | `api.test.ts`, web tests |
 | Sensible HTTP status codes | 202 accepted, 200, 400, 404, 409, 413, 422, 500, 502, 503 | `api.test.ts` |
 | Separation of concerns / no god files / no copy-paste / clear naming | routes → services → repos → providers; largest source file ≈ 200 lines | Code review |
@@ -43,14 +43,19 @@ Source of truth: `Turium_AI_Interview_Assignment.pdf`. Each row maps a requireme
 | --- | --- | --- |
 | Async ingestion with persisted status, 202 response | `items.status`, `worker/ingestionWorker.ts`, `POST /ingest` → 202 | API: ingestion suites |
 | Retries without duplicate chunks | `chunksRepo.replaceForItem` in one transaction, `UNIQUE(item_id, chunk_index)`, deterministic ids | API: "does not duplicate chunks on reprocessing" |
-| Interrupted jobs recovered after restart | `itemsRepo.recoverInterrupted` on `worker.start()` | API: "requeues items left in processing after a restart" |
+| Interrupted jobs recovered after restart, within the attempt limit | `itemsRepo.recoverInterrupted(maxAttempts)` on `worker.start()` | API: "requeues items left in processing after a restart"; `worker.test.ts` attempt-limit and crash-loop tests |
+| Worker survives unexpected (non-item) failures with backoff; visible on health | `ingestionWorker.ts#loop`, `status()`, `routes/health.ts` | `worker.test.ts` resilience tests |
+| Items stranded in `processing` by a failed outcome write are recovered at runtime, within the attempt limit, only while the worker is idle | `ingestionWorker.ts#recoverOrphans`, `itemsRepo.recoverOrphaned` | `worker.test.ts` runtime recovery tests |
+| A late or stale outcome cannot overwrite a finished item; a lost indexing race rolls back its chunks | `itemsRepo.setContent/markIndexed/markFailed/requeue` (status guards), `ingestionService.ts#processItem`, `ItemStateConflictError`, `routes/items.ts` retry | `worker.test.ts` outcome-write tests; `api.test.ts` stale fetch and retry-race tests |
+| Bounded shutdown; idempotent start; no restart while a timed-out job is in flight | `ingestionWorker.ts#stop/start/loop` | `worker.test.ts` bounded shutdown and lifecycle tests |
 | Manual retry | `POST /items/:id/retry`, UI Retry button | API + `ItemList.test.tsx` |
 | SSRF: private/loopback/link-local/IPv6 rejected | `services/ipPolicy.ts`, `urlFetcher.ts#validateUrl/resolveValidatedAddress` | Unit: `ipPolicy.test.ts` (40+ addresses), `urlFetcher.test.ts`; Live step 4 |
 | DNS rebinding mitigation | connection pinned to validated IP via custom `lookup` | `urlFetcher.test.ts` "sends the original Host header while connecting to the pinned IP" |
-| Redirect re-validation, timeouts, size + content-type limits | `urlFetcher.ts` | `urlFetcher.test.ts` |
+| Redirect re-validation, total deadline (incl. slow-drip bodies and DNS), size + content-type limits | `urlFetcher.ts` | `urlFetcher.test.ts` |
 | Page content treated as untrusted | `answerGenerator.ts` system prompt + `<passage>` wrapping; no tools | `htmlExtractor.test.ts`, `answerGenerator.test.ts` |
 | Relevance threshold + context budget + dedupe | `retrieval.ts#selectContext` | `retrieval.test.ts` |
-| Insufficient-evidence state, machine readable | `queryService.ts` `insufficientReason`; `AnswerView.tsx` | API: three reasons tested; `AskPanel.test.tsx`; Live step 3 |
+| Insufficient-evidence state, machine readable | `queryService.ts` `insufficientReason` (four reasons); `AnswerView.tsx` | API: all four reasons tested; `answerGenerator.test.ts`; `AskPanel.test.tsx`; Live step 3 |
+| Malformed, uncited or truncated model output never reported as an answer; `sufficient` must be exactly boolean | `answerGenerator.ts#parseAnswer/generateAnswer`, `openAiProvider.ts#completeJson` (`truncated`) | `answerGenerator.test.ts` (incl. strict-`sufficient` table), `openAiProvider.test.ts`, API `never reports sufficient evidence…` and truncation tests |
 | Embedding model identity + dimensions stored, never mixed | `chunks.embedding_model/embedding_dims`, `listForRetrieval` filter, `rankChunks` length guard | `retrieval.test.ts`, provider dimension validation |
 | Provider failures → 502/503, no secret leakage | `openAiProvider.ts#call`, `errorHandler.ts` | API: "maps provider failures to 502/503 with safe messages" |
 | Secrets/private content kept out of logs | request serializers log method/url/status only; key never logged | Code review; smoke log |

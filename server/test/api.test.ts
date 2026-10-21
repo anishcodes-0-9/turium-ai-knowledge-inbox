@@ -1,7 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import request from 'supertest';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildTestApp, type TestApp } from './helpers/testApp.js';
 import { AppError } from '../src/errors.js';
 
@@ -100,6 +100,22 @@ describe('POST /ingest (urls)', () => {
     expect(detail.body.item.chunkCount).toBeGreaterThanOrEqual(2);
   });
 
+  it('a stale URL fetch cannot replace the content of an item another writer finished, and skips embedding', async () => {
+    const res = await api().post('/ingest').send({ type: 'url', url: fixtureUrl('/article') }).expect(202);
+    const id = res.body.item.id as string;
+    const realSetContent = t.items.setContent.bind(t.items);
+    vi.spyOn(t.items, 'setContent').mockImplementationOnce((itemId, fields) => {
+      // While this worker was fetching, another writer finished the item.
+      t.items.markFailed(itemId, { code: 'url_fetch_failed', message: 'other writer' });
+      return realSetContent(itemId, fields);
+    });
+    await t.worker.drain();
+    const item = t.items.getById(id)!;
+    expect(item).toMatchObject({ status: 'failed', errorCode: 'url_fetch_failed', content: null, title: res.body.item.title });
+    expect(t.chunks.countForItem(id)).toBe(0);
+    expect(t.ai.embedCalls).toHaveLength(0); // stopped before paying for embeddings
+  });
+
   it('records a visible failure for hosts resolving to private addresses', async () => {
     const res = await api().post('/ingest').send({ type: 'url', url: 'http://intranet.test/secret' }).expect(202);
     await t.worker.drain();
@@ -164,6 +180,23 @@ describe('POST /items/:id/retry', () => {
     expect(t.chunks.countForItem(res.body.item.id)).toBe(1);
   });
 
+  it('returns 409 and changes nothing if the item stopped being failed between the check and the write', async () => {
+    t.ai.embedError = new AppError('provider_error', 'down', { retryable: false });
+    const res = await api().post('/ingest').send({ type: 'note', content: 'Retry race.' }).expect(202);
+    await t.worker.drain();
+    const id = res.body.item.id as string;
+    const staleFailed = t.items.getById(id)!;
+    t.items.requeue(id, { resetAttempts: true }); // meanwhile: retried elsewhere ...
+    t.items.claimNextPending(); // ... and now being processed
+    const before = t.items.getById(id)!;
+    vi.spyOn(t.items, 'getById').mockReturnValueOnce(staleFailed); // the route's read sees the stale row
+
+    const conflict = await api().post(`/items/${id}/retry`).expect(409);
+    expect(conflict.body.error.code).toBe('conflict');
+    vi.restoreAllMocks();
+    expect(t.items.getById(id)).toEqual(before); // still processing, attempts not reset
+  });
+
   it('rejects retry for non-failed items with 409', async () => {
     const res = await api().post('/ingest').send({ type: 'note', content: 'fine' }).expect(202);
     await t.worker.drain();
@@ -226,11 +259,67 @@ describe('POST /query', () => {
     expect(res.body).toMatchObject({ sufficientEvidence: false, insufficientReason: 'model_reported_insufficient', citations: [] });
   });
 
-  it('drops fabricated citation numbers from the model', async () => {
+  it('never passes on the model\'s own text when it reports insufficient evidence', async () => {
+    await seed();
+    t.ai.chatScript = () => JSON.stringify({ answer: 'Not in the notes, but llamas usually live about 20 years [1].', sufficient: false, citations: [1] });
+    const res = await api().post('/query').send({ question: 'How long do llamas live?' }).expect(200);
+    expect(res.body).toMatchObject({ sufficientEvidence: false, insufficientReason: 'model_reported_insufficient', citations: [] });
+    expect(res.body.answer).toBe('Your saved knowledge does not contain enough information to answer this question.');
+    expect(JSON.stringify(res.body)).not.toContain('20 years');
+  });
+
+  it('drops fabricated citation numbers from the model and strips their markers', async () => {
     await seed();
     t.ai.chatScript = () => JSON.stringify({ answer: 'Steve [1] [9]', sufficient: true, citations: [1, 9, 42] });
     const res = await api().post('/query').send({ question: 'mascot llama named' }).expect(200);
     expect(res.body.citations).toHaveLength(1);
+    expect(res.body.answer).toBe('Steve [1]');
+  });
+
+  it('keeps ordinary bracketed numbers in the answer while still validating the citations', async () => {
+    await seed();
+    t.ai.chatScript = () => JSON.stringify({ answer: 'Steve is the mascot [1]. His badge reads [0] and index [9] is unused.', sufficient: true, citations: [1] });
+    const res = await api().post('/query').send({ question: 'mascot llama named' }).expect(200);
+    expect(res.body.sufficientEvidence).toBe(true);
+    expect(res.body.answer).toBe('Steve is the mascot [1]. His badge reads [0] and index [9] is unused.');
+    expect(res.body.citations).toHaveLength(1);
+    expect(res.body.citations[0].passage).toBe(1);
+  });
+
+  it.each([
+    ['claims sufficiency but cites nothing valid', JSON.stringify({ answer: 'Steve [9]', sufficient: true, citations: [9] })],
+    ['returns prose instead of JSON', 'The mascot is Steve [1].'],
+    ['returns truncated JSON', '{"answer":"The mascot is St'],
+  ])('never reports sufficient evidence when the model %s', async (_label, raw) => {
+    await seed();
+    t.ai.chatScript = () => raw;
+    const res = await api().post('/query').send({ question: 'mascot llama named' }).expect(200);
+    expect(res.body).toMatchObject({ sufficientEvidence: false, insufficientReason: 'unverifiable_answer', citations: [] });
+    expect(res.body.answer).not.toContain('Steve');
+    expect(res.body.retrieval.selected).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['the string "false"', '"false"'],
+    ['the string "no"', '"no"'],
+    ['the number 0', '0'],
+    ['null', 'null'],
+    ['missing', undefined],
+  ])('never reports sufficient evidence when `sufficient` is %s, even with a valid citation', async (_label, value) => {
+    await seed();
+    const sufficient = value === undefined ? '' : `,"sufficient":${value}`;
+    t.ai.chatScript = () => `{"answer":"The notes do not say [1].","citations":[1]${sufficient}}`;
+    const res = await api().post('/query').send({ question: 'mascot llama named' }).expect(200);
+    expect(res.body).toMatchObject({ sufficientEvidence: false, insufficientReason: 'unverifiable_answer', citations: [] });
+    expect(res.body.answer).not.toContain('notes do not say');
+  });
+
+  it('maps a completion cut off by the token limit to a 502 provider error', async () => {
+    await seed();
+    t.ai.chatScript = () => ({ content: '{"answer":"Steve [1]","sufficient":true,"citations":[1]}', truncated: true });
+    const res = await api().post('/query').send({ question: 'mascot llama named' }).expect(502);
+    expect(res.body.error.code).toBe('provider_error');
+    expect(res.body.error.message).toMatch(/token limit/);
   });
 
   it('respects a caller-supplied minScore and topK', async () => {

@@ -19,7 +19,7 @@ export interface Citation {
   score: number;
 }
 
-export type InsufficientReason = 'no_indexed_content' | 'no_relevant_chunks' | 'model_reported_insufficient';
+export type InsufficientReason = 'no_indexed_content' | 'no_relevant_chunks' | 'model_reported_insufficient' | 'unverifiable_answer';
 
 export interface QueryResult {
   answer: string;
@@ -37,6 +37,7 @@ export interface QueryDeps {
 }
 
 const NO_EVIDENCE_ANSWER = 'Your saved knowledge does not contain enough information to answer this question.';
+const UNVERIFIABLE_ANSWER = 'The model did not return an answer that could be tied to your saved sources, so no answer is shown.';
 
 /**
  * RAG pipeline: embed question → rank all compatible chunks → threshold / top-K /
@@ -71,20 +72,19 @@ export async function answerQuestion(deps: QueryDeps, input: { question: string;
 
   const genStarted = Date.now();
   const generated = await generateAnswer(deps.ai, input.question, selected);
-  log.info({ sufficient: generated.sufficient, cited: generated.citedNumbers, parseFallback: generated.parseFallback, ms: Date.now() - genStarted }, 'answer generated');
+  log.info({ outcome: generated.outcome, cited: generated.citedNumbers, parseFallback: generated.parseFallback, ms: Date.now() - genStarted }, 'answer generated');
+  const retrieval = stats({ candidates: candidates.length, aboveThreshold, selected: selected.length, topScore });
 
-  // Citations can only ever point at chunks that were in the prompt (and therefore exist in the DB).
-  const citations: Citation[] = generated.sufficient
-    ? generated.citedNumbers.map((n) => toCitation(n, selected[n - 1]!))
-    : [];
-
-  return {
-    answer: generated.answer,
-    sufficientEvidence: generated.sufficient,
-    insufficientReason: generated.sufficient ? null : 'model_reported_insufficient',
-    citations,
-    retrieval: stats({ candidates: candidates.length, aboveThreshold, selected: selected.length, topScore }),
-  };
+  if (generated.outcome === 'answered') {
+    // Citations can only ever point at chunks that were in the prompt (and therefore exist in the DB).
+    const citations = generated.citedNumbers.map((n) => toCitation(n, selected[n - 1]!));
+    return { answer: generated.answer, sufficientEvidence: true, insufficientReason: null, citations, retrieval };
+  }
+  if (generated.outcome === 'insufficient') {
+    // Fixed text: the model's own wording here is unsupported by the evidence and is not shown.
+    return { answer: NO_EVIDENCE_ANSWER, sufficientEvidence: false, insufficientReason: 'model_reported_insufficient', citations: [], retrieval };
+  }
+  return { answer: UNVERIFIABLE_ANSWER, sufficientEvidence: false, insufficientReason: 'unverifiable_answer', citations: [], retrieval };
 }
 
 function toCitation(passage: number, s: { chunk: { id: string; itemId: string; chunkIndex: number; itemTitle: string; itemSourceType: SourceType; itemUrl: string | null; text: string }; score: number }): Citation {

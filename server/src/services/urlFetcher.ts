@@ -63,16 +63,17 @@ export function validateUrl(raw: string): URL {
  *  - the hostname is resolved up front and *all* resolved addresses must be public
  *  - the TCP connection is pinned to the validated address (custom `lookup`), so a
  *    DNS rebinding between validation and connection cannot change the target
- *  - total timeout, byte cap and content-type allow-list are enforced while streaming
+ *  - one total deadline (`timeoutMs`) covers DNS, connect, headers and body across all
+ *    redirect hops; when it expires the in-flight request is destroyed, so a slow-drip
+ *    server cannot hold the worker (an idle socket timeout alone would not catch this)
+ *  - byte cap and content-type allow-list are enforced while streaming
  */
 export async function fetchUrl(rawUrl: string, opts: FetchOptions, log?: Logger): Promise<FetchedDocument> {
   const deadline = Date.now() + opts.timeoutMs;
   let url = validateUrl(rawUrl);
   for (let redirects = 0; ; redirects++) {
-    const address = await resolveValidatedAddress(url, opts);
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new AppError('url_fetch_failed', 'Timed out while fetching the URL');
-    const res = await requestOnce(url, address, { ...opts, timeoutMs: remaining });
+    const address = await withDeadline(resolveValidatedAddress(url, opts), deadline, 'Timed out while resolving the hostname');
+    const res = await requestOnce(url, address, opts, deadline);
     if (res.kind === 'redirect') {
       if (redirects >= opts.maxRedirects) throw new AppError('url_fetch_failed', `Too many redirects (limit ${opts.maxRedirects})`);
       let next: URL;
@@ -87,6 +88,24 @@ export async function fetchUrl(rawUrl: string, opts: FetchOptions, log?: Logger)
     }
     return { ...res.doc, redirects };
   }
+}
+
+function timeoutError(message = 'Timed out while fetching the URL'): AppError {
+  return new AppError('url_fetch_failed', message);
+}
+
+/**
+ * Rejects with a timeout error if `promise` has not settled by `deadline`. Used for DNS:
+ * the underlying getaddrinfo call cannot be cancelled, but we stop waiting for it.
+ */
+function withDeadline<T>(promise: Promise<T>, deadline: number, message: string): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(timeoutError(message));
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(timeoutError(message)), remaining);
+  });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
 async function resolveValidatedAddress(url: URL, opts: FetchOptions): Promise<{ ip: string; family: 4 | 6 }> {
@@ -112,8 +131,21 @@ async function resolveValidatedAddress(url: URL, opts: FetchOptions): Promise<{ 
 
 type RequestResult = { kind: 'redirect'; location: string } | { kind: 'document'; doc: Omit<FetchedDocument, 'redirects'> };
 
-function requestOnce(url: URL, address: { ip: string; family: 4 | 6 }, opts: FetchOptions): Promise<RequestResult> {
-  return new Promise((resolve, reject) => {
+function requestOnce(url: URL, address: { ip: string; family: 4 | 6 }, opts: FetchOptions, deadline: number): Promise<RequestResult> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(timeoutError());
+  return new Promise((resolvePromise, rejectPromise) => {
+    // Every exit path goes through settle() so the deadline timer is always cleared.
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const resolve = (r: RequestResult) => settle(() => resolvePromise(r));
+    const reject = (e: AppError) => settle(() => rejectPromise(e));
     const transport = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
     const req = transport.request(
@@ -127,30 +159,31 @@ function requestOnce(url: URL, address: { ip: string; family: 4 | 6 }, opts: Fet
         // Pin the socket to the address we validated; keeps SNI/Host on the original hostname.
         lookup: (_host, _options, cb) => cb(null, [{ address: address.ip, family: address.family }] as never),
         servername: url.protocol === 'https:' && !isIP(hostname) ? hostname : undefined,
-        timeout: opts.timeoutMs,
       },
       (res) => {
         const status = res.statusCode ?? 0;
+        // Early exits settle first, then destroy the socket: we never need these bodies,
+        // and draining them in the background would let a slow-drip body outlive the deadline.
         if ([301, 302, 303, 307, 308].includes(status)) {
-          res.resume();
           const location = res.headers.location;
-          if (!location) return reject(new AppError('url_fetch_failed', 'Redirect response had no Location header'));
-          return resolve({ kind: 'redirect', location });
+          if (!location) reject(new AppError('url_fetch_failed', 'Redirect response had no Location header'));
+          else resolve({ kind: 'redirect', location });
+          return void req.destroy();
         }
         if (status < 200 || status >= 300) {
-          res.resume();
-          return reject(new AppError('url_fetch_failed', `Remote server responded with HTTP ${status}`, { retryable: status >= 500 }));
+          reject(new AppError('url_fetch_failed', `Remote server responded with HTTP ${status}`, { retryable: status >= 500 }));
+          return void req.destroy();
         }
         const rawType = (res.headers['content-type'] ?? '').toLowerCase();
         const mediaType = rawType.split(';')[0]!.trim();
         if (!ALLOWED_CONTENT_TYPES.includes(mediaType)) {
-          res.resume();
-          return reject(new AppError('url_unsupported_content', `Unsupported content type "${mediaType || 'unknown'}"; only HTML and plain text pages can be saved`));
+          reject(new AppError('url_unsupported_content', `Unsupported content type "${mediaType || 'unknown'}"; only HTML and plain text pages can be saved`));
+          return void req.destroy();
         }
         const declared = Number(res.headers['content-length']);
         if (Number.isFinite(declared) && declared > opts.maxBytes) {
-          res.resume();
-          return reject(new AppError('url_fetch_failed', `Page is too large (${declared} bytes; limit ${opts.maxBytes})`, { retryable: false }));
+          reject(new AppError('url_fetch_failed', `Page is too large (${declared} bytes; limit ${opts.maxBytes})`, { retryable: false }));
+          return void req.destroy();
         }
         const chunks: Buffer[] = [];
         let received = 0;
@@ -175,7 +208,9 @@ function requestOnce(url: URL, address: { ip: string; family: 4 | 6 }, opts: Fet
         res.on('error', (err) => reject(wrapNetworkError(err)));
       },
     );
-    req.on('timeout', () => req.destroy(new AppError('url_fetch_failed', 'Timed out while fetching the URL')));
+    // Hard deadline for this hop (connect + headers + full body). Destroying the request
+    // closes the socket, so the remote side sees the connection end.
+    timer = setTimeout(() => req.destroy(timeoutError()), remaining);
     req.on('error', (err) => reject(wrapNetworkError(err)));
     req.end();
   });

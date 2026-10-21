@@ -12,6 +12,7 @@ const REASON_TEXT: Record<InsufficientReason, string> = {
   no_indexed_content: 'There is no indexed content yet. Save a note or URL and wait for it to finish indexing.',
   no_relevant_chunks: 'Nothing in your saved knowledge was similar enough to this question.',
   model_reported_insufficient: 'Related content was found, but it does not actually answer the question.',
+  unverifiable_answer: 'The model did not return an answer that could be tied to your saved sources, so no answer is shown.',
 };
 
 export function AnswerView({ question, result, onOpenItem }: Props) {
@@ -21,7 +22,6 @@ export function AnswerView({ question, result, onOpenItem }: Props) {
         <p className="answer-question">Q: {question}</p>
         <p><strong>Not enough evidence in your saved knowledge.</strong></p>
         <p className="muted">{result.insufficientReason ? REASON_TEXT[result.insufficientReason] : result.answer}</p>
-        {result.insufficientReason === 'model_reported_insufficient' && result.answer && <p className="muted">Model note: {result.answer}</p>}
         <RetrievalStats result={result} />
       </div>
     );

@@ -34,9 +34,23 @@ const server = ctx.app.listen(config.PORT, () => {
 async function shutdown(signal: string): Promise<void> {
   log.info({ signal }, 'shutting down');
   server.close();
+  // Bounded: an in-flight item that does not finish in time stays `processing`
+  // and is recovered (within its attempt budget) on the next start.
   await ctx.worker.stop();
   ctx.db.close();
   process.exit(0);
 }
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+// Last resort: record anything that escaped every handler as a structured fatal
+// log, then exit non-zero. State is not trustworthy after this, and a supervisor
+// (or the developer) should see the crash rather than a silently degraded process.
+process.on('unhandledRejection', (reason) => {
+  log.fatal({ err: reason }, 'unhandled promise rejection; exiting');
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  log.fatal({ err }, 'uncaught exception; exiting');
+  process.exit(1);
+});
